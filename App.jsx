@@ -295,9 +295,14 @@ function calcMultiplier(total1405Years, retSys) {
  *            DoD FMR Vol. 7B Ch. 3, Para 030403
  * Each month uses the pay table in effect that calendar year (37 U.S.C. § 1009),
  * correcting for the fact that historical pay tables were lower than current rates.
- * Future months beyond PAY_TABLE_YEAR use the most recent available table.
+ * Future months beyond PAY_TABLE_YEAR use the most recent available table,
+ * optionally compounded by a projected annual raise rate.
+ *
+ * @param annualRaiseRate  Decimal (e.g. 0.02 = 2%). Applied only to months
+ *                         beyond PAY_TABLE_YEAR when useProjectedRaise = true.
+ *                         Reflects 37 U.S.C. § 1009 ECI-linked raise mechanism.
  */
-function calcHigh3(retDateStr, grade, promotionDateStr, prevGrade, pebdStr) {
+function calcHigh3(retDateStr, grade, promotionDateStr, prevGrade, pebdStr, annualRaiseRate = 0, useProjectedRaise = false) {
   const retDate = new Date(retDateStr);
   const promDate = promotionDateStr ? new Date(promotionDateStr) : null;
   const pebd = new Date(pebdStr);
@@ -308,6 +313,7 @@ function calcHigh3(retDateStr, grade, promotionDateStr, prevGrade, pebdStr) {
     const d = new Date(retDate);
     d.setMonth(d.getMonth() - i);
     const dStr = d.toISOString().slice(0, 10);
+    const dYear = d.getFullYear();
 
     // Determine grade: if promotion is within 36-month window, use prevGrade before it
     const g = (promDate && d < promDate && prevGrade) ? prevGrade : grade;
@@ -318,10 +324,21 @@ function calcHigh3(retDateStr, grade, promotionDateStr, prevGrade, pebdStr) {
     const yos = yosMonths / 12;
 
     // Use historically correct pay table for this month — 37 U.S.C. § 1009
-    const pay = getBasicPay(g, yos, dStr);
-    const tableYear = Math.max(2023, Math.min(PAY_TABLE_YEAR, d.getFullYear()));
+    // For months beyond PAY_TABLE_YEAR, clamp to most recent table then
+    // optionally project forward using the compounded annual raise rate.
+    const basePay = getBasicPay(g, yos, dStr);
+    const tableYear = Math.max(2023, Math.min(PAY_TABLE_YEAR, dYear));
+    const yearsAhead = Math.max(0, dYear - PAY_TABLE_YEAR);
+    const projected = useProjectedRaise && yearsAhead > 0;
+    const raiseFactor = projected ? Math.pow(1 + annualRaiseRate, yearsAhead) : 1;
+    const pay = Math.round(basePay * raiseFactor);
+
     total += pay;
-    months.push({ date: d.toLocaleDateString("en-US",{year:"numeric",month:"short"}), grade: g, yos: yos.toFixed(1), pay, tableYear });
+    months.push({
+      date: d.toLocaleDateString("en-US",{year:"numeric",month:"short"}),
+      grade: g, yos: yos.toFixed(1), pay, tableYear,
+      projected, yearsAhead, raiseFactor
+    });
   }
   return { avg: total / 36, months };
 }
@@ -330,19 +347,22 @@ function calcHigh3(retDateStr, grade, promotionDateStr, prevGrade, pebdStr) {
  * Calculate Final Pay retired pay base (last month's basic pay only).
  * Authority: 10 U.S.C. § 1406(c)
  */
-function calcFinalPay(retDateStr, grade, pebdStr) {
+function calcFinalPay(retDateStr, grade, pebdStr, annualRaiseRate = 0, useProjectedRaise = false) {
   const retDate = new Date(retDateStr);
   const pebd = new Date(pebdStr);
   const yosMonths = (retDate.getFullYear() - pebd.getFullYear()) * 12
                   + (retDate.getMonth() - pebd.getMonth());
-  return getBasicPay(grade, yosMonths / 12, retDateStr);
+  const basePay = getBasicPay(grade, yosMonths / 12, retDateStr);
+  const yearsAhead = Math.max(0, retDate.getFullYear() - PAY_TABLE_YEAR);
+  const raiseFactor = (useProjectedRaise && yearsAhead > 0) ? Math.pow(1 + annualRaiseRate, yearsAhead) : 1;
+  return Math.round(basePay * raiseFactor);
 }
 
 /**
  * Full retirement calculation for a given retirement date.
  * Returns all intermediate values for transparency and audit.
  */
-function calcRetirement({ retDateStr, adbdStr, pebdStr, iadPoints, grade, promotionDateStr, prevGrade, retSys }) {
+function calcRetirement({ retDateStr, adbdStr, pebdStr, iadPoints, grade, promotionDateStr, prevGrade, retSys, annualRaiseRate, useProjectedRaise }) {
   // Step 1: Active duty months (§ 1405(a)(1)–(a)(2))
   const adMonths = calcADMonths(adbdStr, retDateStr);
   const adYears = adMonths / 12;
@@ -358,10 +378,10 @@ function calcRetirement({ retDateStr, adbdStr, pebdStr, iadPoints, grade, promot
   // Step 4: Retired pay base (§ 1406 or § 1407)
   let retiredPayBase, high3Months;
   if (retSys === "FINAL_PAY") {
-    retiredPayBase = calcFinalPay(retDateStr, grade, pebdStr);
+    retiredPayBase = calcFinalPay(retDateStr, grade, pebdStr, annualRaiseRate, useProjectedRaise);
     high3Months = [];
   } else {
-    const h3 = calcHigh3(retDateStr, grade, promotionDateStr, prevGrade, pebdStr);
+    const h3 = calcHigh3(retDateStr, grade, promotionDateStr, prevGrade, pebdStr, annualRaiseRate, useProjectedRaise);
     retiredPayBase = h3.avg;
     high3Months = h3.months;
   }
@@ -419,6 +439,8 @@ export default function RetirementCalculator() {
   const [retSysOverride, setRetSysOverride] = useState("");
   const [selectedRow, setSelectedRow] = useState(null);
   const [activeTab, setActiveTab] = useState("table");
+  const [useProjectedRaise, setUseProjectedRaise] = useState(false);
+  const [annualRaiseRate, setAnnualRaiseRate] = useState(2.0); // percent, e.g. 2.0 = 2%
 
   const autoRetSys = useMemo(() => detectRetirementSystem(pebd), [pebd]);
   const retSys = retSysOverride || autoRetSys;
@@ -451,11 +473,13 @@ export default function RetirementCalculator() {
         retDateStr, adbdStr: adbd, pebdStr: pebd,
         iadPoints: Number(iadPoints), grade,
         promotionDateStr: promotionDate, prevGrade, retSys,
+        annualRaiseRate: annualRaiseRate / 100,
+        useProjectedRaise,
       });
       rows.push({ ...result, monthOffset: m });
     }
     return rows;
-  }, [pebd, adbd, iadPoints, grade, promotionDate, prevGrade, retSys]);
+  }, [pebd, adbd, iadPoints, grade, promotionDate, prevGrade, retSys, annualRaiseRate, useProjectedRaise]);
 
   const chartData = projections.map(r => ({
     name: new Date(r.retDateStr).toLocaleDateString("en-US", { month:"short", year:"2-digit" }),
@@ -667,6 +691,28 @@ export default function RetirementCalculator() {
   const now24 = projections[23];
   const now60 = projections[59];
 
+  // Custom target retirement date for snapshot
+  const [customMonth, setCustomMonth] = useState(today.getMonth()); // 0-indexed
+  const [customYear, setCustomYear]   = useState(today.getFullYear() + 1);
+
+  const customRowIndex = useMemo(() => {
+    return projections.findIndex(r => {
+      const d = new Date(r.retDateStr);
+      return d.getFullYear() === customYear && d.getMonth() === customMonth;
+    });
+  }, [projections, customMonth, customYear]);
+
+  const customRow = customRowIndex >= 0 ? projections[customRowIndex] : null;
+
+  // Build year options spanning the 60-month projection window
+  const projectionYears = useMemo(() => {
+    const years = new Set();
+    projections.forEach(r => years.add(new Date(r.retDateStr).getFullYear()));
+    return [...years].sort();
+  }, [projections]);
+
+  const MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
   return (
     <div style={styles.root}>
       {/* HEADER */}
@@ -742,6 +788,41 @@ export default function RetirementCalculator() {
               <option value="BRS">Blended Retirement (BRS) — § 1409(b)(2)</option>
             </select>
           </div>
+          <div>
+            <label style={styles.label}>Projected Annual Pay Raise
+              <span style={{...styles.cite, display:"block"}}>Applied to future months beyond {PAY_TABLE_YEAR} pay table (37 U.S.C. § 1009)</span>
+            </label>
+            <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+              <button
+                onClick={() => setUseProjectedRaise(v => !v)}
+                style={{
+                  padding: "6px 12px",
+                  background: useProjectedRaise ? "#1a4a2a" : "#0d1520",
+                  border: `1px solid ${useProjectedRaise ? "#40c080" : "#2a3a50"}`,
+                  color: useProjectedRaise ? "#40c080" : "#4a6080",
+                  borderRadius: "3px",
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                  fontSize: "11px",
+                  fontWeight: "bold",
+                  letterSpacing: "0.06em",
+                  whiteSpace: "nowrap",
+                  flexShrink: 0,
+                }}>
+                {useProjectedRaise ? "● ON" : "○ OFF"}
+              </button>
+              <div style={{ position: "relative", flex: 1 }}>
+                <input
+                  style={{ ...styles.input, paddingRight: "28px", opacity: useProjectedRaise ? 1 : 0.4 }}
+                  type="number" min="0" max="20" step="0.1"
+                  value={annualRaiseRate}
+                  onChange={e => setAnnualRaiseRate(parseFloat(e.target.value) || 0)}
+                  disabled={!useProjectedRaise}
+                />
+                <span style={{ position: "absolute", right: "8px", top: "50%", transform: "translateY(-50%)", color: "#4a6080", fontSize: "12px", pointerEvents: "none" }}>%</span>
+              </div>
+            </div>
+          </div>
         </div>
         <div style={{ marginTop: "12px", ...styles.alert }}>
           <strong>Active System:</strong> {SYSTEM_LABELS[retSys]}
@@ -749,6 +830,11 @@ export default function RetirementCalculator() {
           {retSys !== "FINAL_PAY" && (
             <span style={{ marginLeft: "16px", color: "#4a6080" }}>
               Retired pay base: 36-month average basic pay ending on retirement date (10 U.S.C. § 1407)
+            </span>
+          )}
+          {useProjectedRaise && (
+            <span style={{ marginLeft: "16px", color: "#40c080", fontWeight: "bold" }}>
+              ▲ Projected raise: {annualRaiseRate}%/yr applied to months after {PAY_TABLE_YEAR}
             </span>
           )}
         </div>
@@ -780,6 +866,58 @@ export default function RetirementCalculator() {
                 )}
               </div>
             ))}
+
+            {/* CUSTOM DATE SNAPSHOT CARD */}
+            <div style={{
+              ...styles.stat,
+              border: "2px solid #6080c8",
+              background: "#0a1020",
+              gridColumn: "span 1",
+            }}>
+              <div style={{ ...styles.statLabel, color: "#6080c8", marginBottom: "6px" }}>
+                Custom Date
+              </div>
+              {/* Month + Year pickers */}
+              <div style={{ display: "flex", gap: "4px", marginBottom: "8px" }}>
+                <select
+                  value={customMonth}
+                  onChange={e => setCustomMonth(Number(e.target.value))}
+                  style={{
+                    flex: 1, background: "#0d1520", border: "1px solid #2a3a60",
+                    color: "#c0c8e0", borderRadius: "3px", padding: "4px 2px",
+                    fontSize: "11px", fontFamily: "inherit", outline: "none",
+                  }}>
+                  {MONTH_NAMES.map((m, i) => <option key={i} value={i}>{m}</option>)}
+                </select>
+                <select
+                  value={customYear}
+                  onChange={e => setCustomYear(Number(e.target.value))}
+                  style={{
+                    flex: 1, background: "#0d1520", border: "1px solid #2a3a60",
+                    color: "#c0c8e0", borderRadius: "3px", padding: "4px 2px",
+                    fontSize: "11px", fontFamily: "inherit", outline: "none",
+                  }}>
+                  {projectionYears.map(y => <option key={y} value={y}>{y}</option>)}
+                </select>
+              </div>
+              {customRow ? (
+                <>
+                  <div style={{ ...styles.statVal, color: "#8098e0", fontSize: "18px" }}>
+                    {fmt$(customRow.monthlyPay)}
+                  </div>
+                  <div style={styles.statSub}>
+                    {fmtPct(customRow.multiplier)} × {fmt$(customRow.retiredPayBase)}
+                  </div>
+                  <div style={{ fontSize: "10px", color: "#3a5090", marginTop: "3px" }}>
+                    {new Date(customRow.retDateStr).toLocaleDateString("en-US",{month:"short",year:"numeric"})} · {fmtYrs(customRow.total1405Years)} total
+                  </div>
+                </>
+              ) : (
+                <div style={{ color: "#4a5070", fontSize: "11px", marginTop: "4px" }}>
+                  Outside 60-month window
+                </div>
+              )}
+            </div>
           </div>
         </div>
       )}
@@ -816,6 +954,10 @@ export default function RetirementCalculator() {
               </div>
             )}
             <div style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "11px", color: "#7a8a9e" }}>
+              <div style={{ width: "12px", height: "12px", background: "#0a1228", border: "2px solid #6080c8", borderRadius: "2px", flexShrink: 0 }} />
+              <span><span style={{ color: "#8098e0", fontWeight: "bold" }}>◆ Selected</span> — custom target date from snapshot</span>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "11px", color: "#7a8a9e" }}>
               <div style={{ width: "12px", height: "12px", background: "#1a2a0a", border: "1px solid #4a6080", borderRadius: "2px", flexShrink: 0 }} />
               <span>Selected row (click to expand breakdown)</span>
             </div>
@@ -840,14 +982,19 @@ export default function RetirementCalculator() {
                   const isSelected = selectedRow === i;
                   const isPast = new Date(r.retDateStr) < today;
                   const isFullGradeH3 = i === fullGradeHigh3Index;
+                  const isCustom = i === customRowIndex;
                   const rowBg = isSelected
                     ? "#1a2a0a"
                     : isFullGradeH3
                       ? "#0a2218"
-                      : i % 2 === 0 ? "#0f1622" : "#111827";
+                      : isCustom
+                        ? "#0a1228"
+                        : i % 2 === 0 ? "#0f1622" : "#111827";
                   const rowBorder = isFullGradeH3
                     ? "3px solid #40c080"
-                    : isSelected ? "3px solid #c8a84b" : "3px solid transparent";
+                    : isCustom
+                      ? "3px solid #6080c8"
+                      : isSelected ? "3px solid #c8a84b" : "3px solid transparent";
                   return (
                     <tr key={i}
                       style={{
@@ -855,10 +1002,9 @@ export default function RetirementCalculator() {
                         cursor: "pointer",
                         opacity: isPast ? 0.6 : 1,
                         borderLeft: rowBorder,
-                        outline: isFullGradeH3 && !isSelected ? "1px solid #205040" : "none",
                       }}
                       onClick={() => setSelectedRow(isSelected ? null : i)}>
-                      <td style={{ ...styles.tdLeft, color: isPast ? "#4a6080" : isFullGradeH3 ? "#40c080" : "#e0e8f0" }}>
+                      <td style={{ ...styles.tdLeft, color: isPast ? "#4a6080" : isFullGradeH3 ? "#40c080" : isCustom ? "#8098e0" : "#e0e8f0" }}>
                         {new Date(r.retDateStr).toLocaleDateString("en-US", { year: "numeric", month: "short" })}
                         {isPast && <span style={{ color: "#c8a84b", marginLeft: 6, fontSize: "10px" }}>PAST</span>}
                         {isFullGradeH3 && (
@@ -868,6 +1014,15 @@ export default function RetirementCalculator() {
                             padding: "1px 5px", borderRadius: "2px", fontWeight: "bold",
                           }}>
                             ★ FULL {grade} HIGH-3
+                          </span>
+                        )}
+                        {isCustom && !isFullGradeH3 && (
+                          <span style={{
+                            color: "#8098e0", marginLeft: 6, fontSize: "10px",
+                            background: "#0d1535", border: "1px solid #6080c8",
+                            padding: "1px 5px", borderRadius: "2px", fontWeight: "bold",
+                          }}>
+                            ◆ SELECTED
                           </span>
                         )}
                       </td>
@@ -985,12 +1140,14 @@ export default function RetirementCalculator() {
                     {sel.high3Months.map((m, i) => (
                       <tr key={i} style={{ background: i % 2 === 0 ? "#0f1622" : "#111827" }}>
                         <td style={styles.tdLeft}>{m.date}</td>
-                        <td style={{ ...styles.td, color: m.tableYear < PAY_TABLE_YEAR ? "#c8a84b" : "#4a9080", fontSize: "10px" }}>
-                          {m.tableYear} DFAS {m.tableYear < PAY_TABLE_YEAR ? "✓" : ""}
+                        <td style={{ ...styles.td, color: m.projected ? "#40c080" : m.tableYear < PAY_TABLE_YEAR ? "#c8a84b" : "#4a9080", fontSize: "10px" }}>
+                          {m.projected
+                            ? `${PAY_TABLE_YEAR}+${m.yearsAhead}yr ▲${annualRaiseRate}%`
+                            : `${m.tableYear} DFAS ${m.tableYear < PAY_TABLE_YEAR ? "✓" : ""}`}
                         </td>
                         <td style={{ ...styles.td, color: "#c8a84b" }}>{m.grade}</td>
                         <td style={styles.td}>{m.yos}</td>
-                        <td style={styles.td}>{fmt$(m.pay)}</td>
+                        <td style={{ ...styles.td, color: m.projected ? "#40c080" : undefined }}>{fmt$(m.pay)}</td>
                       </tr>
                     ))}
                     <tr style={{ background: "#1a2a0a" }}>
